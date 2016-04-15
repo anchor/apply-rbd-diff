@@ -1,0 +1,336 @@
+#!/usr/bin/env perl
+
+use 5.010;
+use utf8;
+use strict;
+use warnings;
+
+use Fcntl qw(SEEK_SET);
+
+# Make Time::HiRes an optional dependency. It's only used for the
+# progress meter, so we can do without it.
+BEGIN {
+	if (eval { require Time::HiRes; }) {
+		Time::HiRes->import("time");
+	}
+}
+
+# The maximum number of bytes we will read at a time.
+use constant MAX_READ => 1048576;
+
+sub main;
+
+sub _read;
+sub size;
+sub progress;
+sub readleint;
+
+sub read_snap;
+sub read_size;
+sub read_data;
+sub read_end;
+
+main(@ARGV);
+die "shouldn't happen: fell out of main";
+
+sub main {
+	if (@_) {
+		# Keep Pod::Perldoc as an optional dependency.
+		if (eval { require Pod::Perldoc; }) {
+			@ARGV = ("-T", __FILE__);
+			*STDOUT = *STDERR;
+			Pod::Perldoc->run;
+		}
+		die "no arguments expected";
+	}
+
+	my %readers = (
+		f => \&read_snap,
+		t => \&read_snap,
+		s => \&read_size,
+		w => \&read_data,
+		z => \&read_data,
+		e => \&read_end,
+	);
+
+	open my $in, "<&=", 0 or die "open stdin: $!";
+	open my $out, ">&=", 1 or die "open stdout: $!";
+	open my $zero, "<", "/dev/zero" or die "open /dev/zero: $!";
+
+	my $ident = _read $in, 12;
+	die "read from stdin: $@" unless defined $ident;
+	die "stdin is not an rbd diff v1 stream"
+		unless $ident eq "rbd diff v1\n";
+
+	while (1) {
+		my $type = _read $in, 1;
+		die "read from stdin: $@" unless defined $type;
+		my $r = $readers{$type} or
+			die "unknown record type in rbd diff: $type";
+		&$r($type, $in, $out, $zero);
+	}
+}
+
+sub _read {
+	my ($in, $want) = @_;
+	my ($count, $out);
+	my $off = 0;
+
+	while ($want) {
+		my $count = read $in, $out, $want, $off;
+		unless (defined $count) {
+			$@ = "$!";
+			return undef;
+		}
+		unless ($count) {
+			$@ = "unexpected end of stream";
+			return undef;
+		}
+		$want -= $count;
+		$off += $count;
+	}
+
+	$out;
+}
+
+sub size {
+	state $size = undef;
+
+	my $newsize = shift;
+	$size = $newsize if defined $newsize;
+
+	$size;
+}
+
+sub progress {
+	my ($pos, $bytes) = @_;
+
+	state $start = time;
+	state $time = $start;
+	state $speed = 0;
+	state $cbytes = 0;
+	state $tbytes = 0;
+
+	$cbytes += $bytes;
+	$tbytes += $bytes;
+
+	if ($pos eq "done") {
+		# Produce the final progress state by calculating the entire
+		# duration of the copy. Prevent division-by-zero by assuming a
+		# duration of 1 second in that case.
+		my $elapsed = time - $start;
+		$elapsed = 1 if $elapsed == 0;
+		$speed = $tbytes / $elapsed;
+	} elsif ($cbytes) {
+		my $newtime = time;
+		my $elapsed = $newtime - $time;
+		# Avoid division-by-zero by only updating $speed when 'time'
+		# changes.
+		if ($elapsed) {
+			$speed = $cbytes / $elapsed;
+			$cbytes = 0;
+			$time = $newtime;
+		}
+	}
+
+	my $hspeed = $speed;
+	for (
+		[1024 * 1024 * 1024 * 1024, "TiB/s"],
+		[1024 * 1024 * 1024, "GiB/s"],
+		[1024 * 1024, "MiB/s"],
+		[1024, "KiB/s"],
+		[0, "B/s"],
+	) {
+		if ($hspeed >= $_->[0]) {
+			$hspeed /= $_->[0] if $_->[0] != 0;
+			$hspeed = sprintf "%.3g %s", $hspeed, $_->[1];
+			last;
+		}
+	}
+
+	print STDERR "\r[";
+
+	my ($len, $p) = (50, undef);
+	if ($pos eq "done") {
+		$p = 1;
+		printf STDERR ("=" x $len);
+	} elsif (my $size = size) {
+		$p = $pos / $size;
+
+		my $prog = int($p * $len);
+		$prog = $len if $prog > $len;
+
+		my $left = $len - $prog - 1;
+		$left = 0 if $left < 0;
+
+		print STDERR ("=" x $prog);
+		print STDERR ">" if $prog < $len;
+		print STDERR (" " x $left);
+	} else {
+		printf STDERR "%-${len}s", "(unknown size)";
+	}
+
+	print STDERR "] (";
+
+	if (defined $p) {
+		printf STDERR "%d%%", ($p * 100);
+	} else {
+		print STDERR "??%";
+	}
+
+	printf STDERR ", %-11s", "$hspeed)";
+}
+
+sub readleint {
+	my ($in, $bytes) = @_;
+	local $_ = _read $in, $bytes;
+	return undef unless defined $_;
+	unpack ($bytes == 8 ? "q<" : "l<");
+}
+
+sub read_snap {
+	my ($type, $in, $out, $zero) = @_;
+
+	my $len = readleint $in, 4;
+	die "read from stdin: $@" unless defined $len;
+	die "bad snapshot name length: $len" if $len < 0;
+	die "excessive snapshot name length: $len" if $len > MAX_READ;
+
+	# Skip over the snapshot name; we won't use it.
+	die "read from stdin: $@" unless defined (_read $in, $len);
+}
+
+sub read_size {
+	my ($type, $in, $out, $zero) = @_;
+
+	my $size = readleint $in, 8;
+	die "read from stdin: $@" unless defined $size;
+	die "bad image size: $size" if $size < 0;
+
+	size $size;
+	progress 0, 0;
+}
+
+sub read_data {
+	my ($type, $in, $out, $zero) = @_;
+
+	my $off = readleint $in, 8;
+	die "read from stdin: $@" unless defined $off;
+	die "bad chunk offset: $off" if $off < 0;
+
+	my $len = readleint $in, 8;
+	die "read from stdin: $@" unless defined $len;
+	die "bad chunk length: $len" if $len < 0;
+
+	if (defined (my $size = size)) {
+		die "chunk of $len bytes at offset $off extends past size $size"
+			if ($off + $len) > $size;
+	}
+
+	progress $off, 0;
+
+	my $in_is = "stdin";
+	if ($type eq "z") {
+		$in = $zero;
+		$in_is = "/dev/zero";
+	}
+
+	while ($len) {
+		my $want = MAX_READ;
+		$want = $len if $len < $want;
+
+		my $count = read $in, (my $data), $want;
+		die "read from $in_is: $!" unless defined $count;
+		die "read from $in_is: unexpected end of stream" unless $count;
+
+		sysseek $out, $off, SEEK_SET or die "seek on stdout: $!";
+
+		my ($todo, $wcount, $woff) = ($count, 0, 0);
+		while ($todo) {
+			my $wcount = syswrite $out, $data, $todo, $woff;
+			if (!defined $wcount) {
+				next if $!{EINTR};
+				die "write to stdout: $!";
+			}
+			$todo -= $wcount;
+			$woff += $wcount;
+		}
+
+		$len -= $count;
+		$off += $count;
+		progress $off, $count;
+	}
+}
+
+sub read_end {
+	progress "done", 0;
+	print STDERR "\n";
+	exit 0;
+}
+
+=head1 NAME
+
+apply-rbd-diff - apply an RBD diff to an ordinary volume
+
+=head1 SYNOPSIS
+
+  rbd --no-progress export-diff pool/vol - --from-snap snap | \
+    apply-rbd-diff >/dev/sd0a
+
+=head1 DESCRIPTION
+
+This script reads an RBD diff stream on standard input and writes the
+changed portions of the image to standard output. It presents a
+progress meter on standard error.
+
+No arguments are accepted at present. If any are provided, this
+documentation will be displayed on standard error and the script will
+exit unsuccessfully.
+
+=head1 COMPATIBILITY
+
+This script has no dependencies other than Perl 5.10 or newer and the
+Fcntl module included with Perl. It can therefore simply be copied onto
+any relatively recent system and run.
+
+Note that some additional functionality may be available if you have
+other Perl modules installed:
+
+=over 4
+
+=item Time::HiRes
+
+Improves the precision of the progress meter.
+
+=item Pod::Perldoc
+
+Displays this documentation if invalid arguments are supplied.
+
+=back
+
+=head1 SEE ALSO
+
+rbd(8),
+L<RBD Incremental Backup|http://docs.ceph.com/docs/master/dev/rbd-diff/>
+
+=head1 AUTHOR
+
+Steven McDonald, E<lt>steven.mcdonald@anchor.net.auE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (c) 2016 Anchor Systems Pty Ltd
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+=cut
